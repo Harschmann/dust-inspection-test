@@ -1,0 +1,160 @@
+"""
+Generalized Camera Lens Detector
+==================================
+Works on ANY phone — no color assumption about the module body.
+
+Core idea:
+  A camera lens = a DARK circle with a BRIGHTER ring around it.
+  That contrast (inside darker than outside) is true regardless of
+  whether the surrounding body is blue, cyan, silver, gold, black, etc.
+
+  For every circle HoughCircles proposes:
+    inner_mean  = average brightness INSIDE  the circle
+    outer_mean  = average brightness in a thin ring JUST OUTSIDE the circle
+    contrast    = outer_mean - inner_mean
+
+  Real lens  → contrast is HIGH   (dark inside, bright surround)
+  False ring → contrast is LOW    (similar brightness on both sides)
+
+TUNING GUIDE
+─────────────────────────────────────────────────────────────────
+MIN_RADIUS      smallest lens you want to detect (px)
+MAX_RADIUS      largest  lens you want to detect (px)
+MIN_DIST        minimum distance between two lens centres (px)
+                  set this to roughly MIN_RADIUS*2
+PARAM2          HoughCircles sensitivity
+                  lower  → finds more  circles (may add false ones)
+                  higher → finds fewer circles (may miss real ones)
+                  start at 25, step by ±5
+MIN_CONTRAST    contrast threshold (outer_mean - inner_mean)
+                  real lenses are very dark, so this can be 30-60
+                  lower if a real lens is being rejected
+                  raise if false circles are passing through
+OUTER_RING_PX   thickness of the annular ring measured OUTSIDE the circle
+                  used to sample the "surround" brightness
+N_LENSES        how many lenses to keep (takes N with highest contrast)
+"""
+
+import cv2
+import numpy as np
+import sys
+
+# ══════════════════════════════════════════════════════════════
+#  TUNING BLOCK
+# ══════════════════════════════════════════════════════════════
+MIN_RADIUS    = 40    # px — raise if tiny false circles appear
+MAX_RADIUS    = 350   # px — lower if whole module gets circled
+MIN_DIST      = 80    # px — min gap between two lens centres
+PARAM2        = 25    # sensitivity (lower = more circles found)
+MIN_CONTRAST  = 30    # outer_mean - inner_mean must exceed this
+OUTER_RING_PX = 18    # px — thickness of ring sampled outside circle
+N_LENSES      = 2     # keep this many lenses (highest contrast wins)
+# ══════════════════════════════════════════════════════════════
+
+IMAGE  = "img34.png"
+COLORS = [(0,255,0),(0,180,255),(255,80,0),(0,80,255)]
+
+
+def fit(im, max_w=1000, max_h=750):
+    h, w = im.shape[:2]
+    scale = min(max_w/w, max_h/h, 1.0)
+    return cv2.resize(im,(int(w*scale),int(h*scale))) if scale<1 else im
+
+
+def contrast_score(gray, cx, cy, r, ring_px):
+    """
+    Returns (inner_mean, outer_mean, contrast).
+    inner  = mean brightness inside  the circle
+    outer  = mean brightness in a ring of thickness ring_px outside the circle
+    """
+    h, w = gray.shape
+    inner_mask = np.zeros((h, w), np.uint8)
+    outer_mask = np.zeros((h, w), np.uint8)
+    cv2.circle(inner_mask, (cx, cy), r,           255, -1)
+    cv2.circle(outer_mask, (cx, cy), r + ring_px, 255, -1)
+    outer_mask = cv2.subtract(outer_mask, inner_mask)   # ring only
+
+    inner_mean = cv2.mean(gray, mask=inner_mask)[0]
+    outer_mean = cv2.mean(gray, mask=outer_mask)[0]
+    return inner_mean, outer_mean, outer_mean - inner_mean
+
+
+# ── Load ──────────────────────────────────────────────────────
+img = cv2.imread(IMAGE)
+if img is None:
+    print(f"Cannot load {IMAGE}"); sys.exit(1)
+print(f"Image size: {img.shape[1]} x {img.shape[0]}")
+
+gray   = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+smooth = cv2.bilateralFilter(gray, 9, 75, 75)   # edge-preserving smooth
+
+# ── Detect all candidate circles (no filtering yet) ──────────
+circles = cv2.HoughCircles(
+    smooth,
+    cv2.HOUGH_GRADIENT,
+    dp=1.2,
+    minDist=MIN_DIST,
+    param1=60,
+    param2=PARAM2,
+    minRadius=MIN_RADIUS,
+    maxRadius=MAX_RADIUS,
+)
+
+result   = img.copy()
+crops    = []
+
+if circles is None:
+    print("No circles found at all — lower PARAM2 or adjust MIN/MAX_RADIUS")
+else:
+    circles = np.round(circles[0]).astype(int)
+    print(f"\nRaw circles from Hough: {len(circles)}")
+    print(f"{'#':>3}  {'cx':>5} {'cy':>5} {'r':>5}  "
+          f"{'inner':>7} {'outer':>7} {'contrast':>9}  {'verdict'}")
+    print("─" * 65)
+
+    # Score every candidate
+    scored = []
+    for cx, cy, r in circles:
+        inner, outer, contrast = contrast_score(smooth, cx, cy, r, OUTER_RING_PX)
+        scored.append((contrast, cx, cy, r, inner, outer))
+
+    # Print all so you can see what's happening
+    for i, (contrast, cx, cy, r, inner, outer) in enumerate(
+            sorted(scored, key=lambda x: x[0], reverse=True)):
+        verdict = "✓ LENS" if contrast >= MIN_CONTRAST else "✗ false"
+        print(f"{i+1:>3}  {cx:>5} {cy:>5} {r:>5}  "
+              f"{inner:>7.1f} {outer:>7.1f} {contrast:>9.1f}  {verdict}")
+
+    # Keep only those passing MIN_CONTRAST, then top N by contrast
+    passed = [(c, cx, cy, r) for c, cx, cy, r, _, _ in scored
+              if c >= MIN_CONTRAST]
+    passed.sort(reverse=True)          # highest contrast first
+    lenses = passed[:N_LENSES]
+
+    print(f"\nFinal lenses kept: {len(lenses)}")
+
+    h_img, w_img = img.shape[:2]
+    for i, (contrast, cx, cy, r) in enumerate(lenses):
+        color = COLORS[i % len(COLORS)]
+        print(f"  Lens {i+1}: centre=({cx},{cy})  r={r}  contrast={contrast:.1f}")
+
+        cv2.circle(result, (cx, cy), r, color, 2)
+        cv2.circle(result, (cx, cy), 4, color, -1)
+        cv2.putText(result, f"Lens {i+1}  r={r}",
+                    (cx - r, cy - r - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+        x1 = max(0, cx-r); y1 = max(0, cy-r)
+        x2 = min(w_img, cx+r); y2 = min(h_img, cy+r)
+        crops.append((i+1, img[y1:y2, x1:x2].copy()))
+
+    for idx, crop in crops:
+        cv2.imshow(f"Lens {idx} crop", fit(crop, 400, 400))
+
+# ── Display ───────────────────────────────────────────────────
+cv2.imshow("1 - Original",        fit(img))
+cv2.imshow("2 - Lens detection",  fit(result))
+cv2.imwrite("out_lens_detect.png", result)
+print("\nSaved: out_lens_detect.png  |  Press any key to exit.")
+cv2.waitKey(0)
+cv2.destroyAllWindows()
